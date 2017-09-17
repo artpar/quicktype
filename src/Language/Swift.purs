@@ -1,5 +1,6 @@
 module Language.Swift
-    ( renderer
+    ( swift3Renderer
+    , swift4Renderer
     ) where
 
 import Prelude
@@ -13,6 +14,7 @@ import Data.Map as M
 import Data.Maybe (Maybe(..))
 import Data.String as String
 import Data.String.Util (camelCase, capitalize, decapitalize, genericStringEscape, intToHex, legalizeCharacters, startWithLetter)
+import Data.Tuple (Tuple(..))
 import Doc (Doc, Namer, Renderer, blank, combineNames, forEachClass_, forEachProperty_, forEachTopLevel_, forEachUnion_, forbidNamer, getTypeNameForUnion, indent, line, lookupClassName, lookupName, lookupUnionName, renderRenderItems, simpleNamer, transformPropertyNames, unionIsNotSimpleNullable, unionNameIntercalated)
 import IRGraph (IRClassData(..), IRType(..), IRUnionRep, canBeNull, forUnion_, isUnionMember, nullableFromUnion, removeNullFromUnion, unionToList)
 
@@ -27,12 +29,32 @@ keywords =
     , "checkNull", "removeNSNull", "nilToNSNull", "convertArray", "convertOptional", "convertDict", "convertDouble"
     ]
 
-renderer :: Renderer
-renderer =
-    { name: "Swift"
+swift3Renderer :: Renderer
+swift3Renderer =
+    { name: "Swift 3"
     , aceMode: "swift"
     , extension: "swift"
-    , doc: swiftDoc
+    , doc: swift3Doc
+    , options: []
+    , transforms:
+        { nameForClass: simpleNamer nameForClass
+        , nextName: \s -> "Other" <> s
+        , forbiddenNames: keywords
+        , topLevelName: forbidNamer (swiftNameStyle true) (\n -> [swiftNameStyle true n])
+        , unions: Just
+            { predicate: unionIsNotSimpleNullable
+            , properName: simpleNamer (swiftNameStyle true <<< combineNames)
+            , nameFromTypes: simpleNamer (unionNameIntercalated (swiftNameStyle true) "Or")
+            }
+        }
+    }
+
+swift4Renderer :: Renderer
+swift4Renderer =
+    { name: "Swift 4"
+    , aceMode: "swift"
+    , extension: "swift4"
+    , doc: swift4Doc
     , options: []
     , transforms:
         { nameForClass: simpleNamer nameForClass
@@ -70,8 +92,8 @@ stringEscape =
         unicodeEscape i =
             "\\u{" <> (String.fromCharArray $ intToHex 0 i) <> "}"
 
-swiftDoc :: Doc Unit
-swiftDoc = do
+swift3Doc :: Doc Unit
+swift3Doc = do
     line "// To parse the JSON, add this file to your project and do:"
     line "//"
     forEachTopLevel_ \topLevelName topLevelType -> do
@@ -81,7 +103,7 @@ swiftDoc = do
     line "import Foundation"
     blank
 
-    renderRenderItems blank (Just renderTopLevelAlias) renderClassDefinition (Just renderUnionDefinition)
+    renderRenderItems blank (Just renderTopLevelAlias) (renderClassDefinition false) (Just $ renderUnionDefinition false)
 
     blank
     line $ "// Serialization extensions"
@@ -90,7 +112,7 @@ swiftDoc = do
 
     forEachClass_ \className properties -> do
         blank
-        renderClassExtension className properties
+        renderClassExtension3 className properties
 
     forEachUnion_ \unionName unionRep -> do
         blank
@@ -98,6 +120,21 @@ swiftDoc = do
 
     blank
     supportFunctions
+
+swift4Doc :: Doc Unit
+swift4Doc = do
+    -- FIXME: usage comments
+    line "import Foundation"
+    blank
+
+    renderRenderItems blank (Just renderTopLevelAlias) (renderClassDefinition true) (Just $ renderUnionDefinition true)
+
+    blank
+    line $ "// Serialization extensions"
+
+    forEachClass_ \className properties -> do
+        blank
+        renderClassExtension4 className properties
 
 supportFunctions :: Doc Unit
 supportFunctions = do
@@ -282,11 +319,16 @@ renderTopLevelAlias topLevelName topLevelType = do
     top <- renderType topLevelType
     line $ "typealias "<> topLevelName <> " = " <> top
 
-renderClassDefinition :: String -> Map String IRType -> Doc Unit
-renderClassDefinition className properties = do
+codableString :: Boolean -> String
+codableString true = " : Codable"
+codableString false = ""
+
+renderClassDefinition :: Boolean -> String -> Map String IRType -> Doc Unit
+renderClassDefinition codable className properties = do
     let forbidden = keywords <> ["json", "any"]
+    -- FIXME: we compute these here, and later again when rendering the extension
     let propertyNames = makePropertyNames properties "" forbidden
-    line $ "struct " <> className <> " {"
+    line $ "struct " <> className <> codableString codable <> " {"
     indent do
         forEachProperty_ properties propertyNames \_ ptype fieldName _ -> do
             rendered <- renderType ptype
@@ -354,8 +396,8 @@ renderTopLevelExtensions topLevelName topLevelType = do
 
     line "}"
 
-renderClassExtension :: String -> Map String IRType -> Doc Unit
-renderClassExtension className properties = do
+renderClassExtension3 :: String -> Map String IRType -> Doc Unit
+renderClassExtension3 className properties = do
     let forbidden = keywords <> ["jsonUntyped", "json"]
     let propertyNames = makePropertyNames properties "" forbidden
     line $ "extension " <> className <> " {"
@@ -397,6 +439,18 @@ renderClassExtension className properties = do
         line "}"
     line "}"
 
+renderClassExtension4 :: String -> Map String IRType -> Doc Unit
+renderClassExtension4 className properties = do
+    let propertyNames = makePropertyNames properties "" keywords
+    line $ "extension " <> className <> " {"
+    indent do
+        line "enum CodingKeys : String, CodingKey {"
+        indent do
+            for_ (M.toUnfoldable propertyNames :: Array (Tuple String String)) \(Tuple jsonName swiftName) -> do
+                line $ "case " <> swiftName <> " = \"" <> stringEscape jsonName <> "\""
+        line "}"
+    line "}"
+
 makePropertyNames :: Map String IRType -> String -> Array String -> Map String String
 makePropertyNames properties suffix forbidden =
     transformPropertyNames (fieldNamer suffix) otherField forbidden properties
@@ -407,10 +461,10 @@ makePropertyNames properties suffix forbidden =
         otherField :: String -> String
         otherField name = "other" <> capitalize name
 
-renderUnionDefinition :: String -> IRUnionRep -> Doc Unit
-renderUnionDefinition unionName unionRep = do
+renderUnionDefinition :: Boolean -> String -> IRUnionRep -> Doc Unit
+renderUnionDefinition codable unionName unionRep = do
     let { hasNull, nonNullUnion } = removeNullFromUnion unionRep
-    line $ "enum " <> unionName <> " {"
+    line $ "enum " <> unionName <> codableString codable <> " {"
     indent do
         forUnion_ nonNullUnion \typ -> do
             name <- caseName typ
