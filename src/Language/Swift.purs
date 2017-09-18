@@ -108,7 +108,7 @@ swift3Doc = do
     blank
     line $ "// Serialization extensions"
 
-    forEachTopLevel_ renderTopLevelExtensions
+    forEachTopLevel_ renderTopLevelExtensions3
 
     forEachClass_ \className properties -> do
         blank
@@ -116,7 +116,7 @@ swift3Doc = do
 
     forEachUnion_ \unionName unionRep -> do
         blank
-        renderUnionExtension unionName unionRep
+        renderUnionExtension3 unionName unionRep
 
     blank
     supportFunctions
@@ -132,9 +132,15 @@ swift4Doc = do
     blank
     line $ "// Serialization extensions"
 
+    forEachTopLevel_ renderTopLevelExtensions4
+
     forEachClass_ \className properties -> do
         blank
         renderClassExtension4 className properties
+
+    forEachUnion_ \unionName unionRep -> do
+        blank
+        renderUnionExtension4 unionName unionRep
 
 supportFunctions :: Doc Unit
 supportFunctions = do
@@ -335,15 +341,17 @@ renderClassDefinition codable className properties = do
             line $ "let " <> fieldName <> ": " <> rendered
     line "}"
 
-renderTopLevelExtensions :: String -> IRType -> Doc Unit
-renderTopLevelExtensions topLevelName topLevelType = do
+renderExtensionType :: IRType -> Doc String
+renderExtensionType (IRArray t) = ("Array where Element == " <> _) <$> renderType t
+renderExtensionType (IRMap t) = ("Dictionary where Key == String, Value == " <> _) <$> renderType t
+renderExtensionType t = renderType t
+
+renderTopLevelExtensions3 :: String -> IRType -> Doc Unit
+renderTopLevelExtensions3 topLevelName topLevelType = do
     blank
 
     topLevelRendered <- renderType topLevelType
-    extensionType <- case topLevelType of
-        IRArray t -> ("Array where Element == " <> _) <$> renderType t
-        IRMap t -> ("Dictionary where Key == String, Value == " <> _) <$> renderType t
-        _ -> pure topLevelRendered
+    extensionType <- renderExtensionType topLevelType
 
     line $ "extension " <> extensionType <> " {"
     indent do
@@ -395,6 +403,44 @@ renderTopLevelExtensions topLevelName topLevelType = do
         line "}"
 
     line "}"
+
+renderTopLevelExtensions4 :: String -> IRType -> Doc Unit
+renderTopLevelExtensions4 topLevelName topLevelType = do
+    blank
+
+    topLevelRendered <- renderType topLevelType
+    extensionType <- renderExtensionType topLevelType
+
+    line $ "extension " <> extensionType <> " {"
+    indent do
+        line $ "init?(fromString json: String, using encoding: String.Encoding = .utf8) {"
+        indent do
+            line "guard let data = json.data(using: encoding) else { return nil }"
+            line "self.init(fromData: data)"
+        line "}"
+        blank
+        line $ "init?(fromData data: Data) {"
+        indent do
+            line "let decoder = JSONDecoder()"
+            line $ "guard let result = try? decoder.decode(" <> topLevelRendered <> ".self, from: data) else { return nil }"
+            line "self = result"
+        line "}"
+
+        blank
+        line $ "var jsonData: Data? {"
+        indent do
+            line "let encoder = JSONEncoder()"
+            line "return try? encoder.encode(self)"
+        line "}"
+            
+        blank
+        line $ "var jsonString: String? {"
+        indent do
+            line $ "guard let data = self.jsonData else { return nil }"
+            line $ "return String(data: data, encoding: .utf8)"
+        line "}"
+    line "}"
+
 
 renderClassExtension3 :: String -> Map String IRType -> Doc Unit
 renderClassExtension3 className properties = do
@@ -475,8 +521,8 @@ renderUnionDefinition codable unionName unionRep = do
             line $ "case " <> name
     line "}"
 
-renderUnionExtension :: String -> IRUnionRep -> Doc Unit
-renderUnionExtension unionName unionRep = do
+renderUnionExtension3 :: String -> IRUnionRep -> Doc Unit
+renderUnionExtension3 unionName unionRep = do
     let { hasNull, nonNullUnion } = removeNullFromUnion unionRep
     line $ "extension " <> unionName <> " {"
     indent do
@@ -516,6 +562,59 @@ renderUnionExtension unionName unionRep = do
         convertCode <- convertAny t "v"
         name <- caseName t
         line $ "if let x = " <> convertCode <> " { return ." <> name <> "(x) }"
+
+renderUnionExtension4 :: String -> IRUnionRep -> Doc Unit
+renderUnionExtension4 unionName unionRep = do
+    let { hasNull, nonNullUnion } = removeNullFromUnion unionRep
+    line $ "extension " <> unionName <> " {"
+    indent do
+        line "init(from decoder: Decoder) throws {"
+        indent do
+            line "let container = try decoder.singleValueContainer()"
+            when (isUnionMember IRBool nonNullUnion) do
+                renderCase IRBool
+            when (isUnionMember IRInteger nonNullUnion) do
+                renderCase IRInteger
+            -- FIXME: this is ugly and inefficient
+            for_ (L.difference (unionToList nonNullUnion) $ L.fromFoldable [IRBool, IRInteger]) \typ -> do
+                renderCase typ
+            when hasNull do
+                name <- caseName IRNull
+                line "if container.decodeNil() {"
+                indent do
+                    line $ "self = ." <> name
+                    line "return"
+                line "}"
+            line $ "throw DecodingError.typeMismatch(" <> unionName <> ".self, DecodingError.Context(codingPath: decoder.codingPath, debugDescription: \"Wrong type for " <> unionName <> "\"))"
+        line "}"
+        blank
+        line "func encode(to encoder: Encoder) throws {"
+        indent do
+            line "var container = encoder.singleValueContainer()"
+            line "switch self {"
+            for_ (unionToList nonNullUnion) \t -> do
+                name <- caseName t
+                line $ "case ." <> name <> "(let x):"
+                indent do
+                    line "try container.encode(x)"
+            when hasNull do
+                name <- caseName IRNull
+                line $ "case ." <> name <> ":"
+                indent do
+                    line "try container.encodeNil()"
+            line "}"
+        line "}"
+    line "}"
+    where
+        renderCase :: IRType -> Doc Unit
+        renderCase t = do
+            name <- caseName t
+            typeName <- renderType t
+            line $ "if let x = try? container.decode(" <> typeName <> ".self) {"
+            indent do
+                line $ "self = ." <> name <> "(x)"
+                line "return"
+            line "}"
 
 caseName :: IRType -> Doc String
 caseName t = swiftNameStyle false <$> getTypeNameForUnion t
